@@ -1,0 +1,11 @@
+{
+  "currentVersion": "v1.0.65",
+  "latestVersion": "v1.0.212",
+  "autoCheck": true,
+  "upgradeSource": "official",
+  "channel": "release",
+  "lastCheckTime": 1784965002429,
+  "releaseNotes": "常规更新，修复已知缺陷及性能优化。",
+  "size": "24.5 MB",
+  "releaseDate": "2026-07-25"
+}
