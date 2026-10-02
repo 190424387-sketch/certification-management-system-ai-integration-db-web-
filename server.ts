@@ -1,3 +1,4 @@
+import 'dotenv/config';
 import multer from 'multer';
 import fs2 from 'fs';
 import crypto from 'crypto';
@@ -19,6 +20,19 @@ import OSS from 'ali-oss';
 import child_process, { spawn, spawnSync } from 'child_process';
 import https from 'https';
 import { createWriteStream, unlinkSync } from 'fs';
+import {
+  AI_SESSION_COOKIE,
+  AI_SESSION_TTL_MS,
+  createAiSession,
+  getAiSessionPhone,
+  getAiSessionToken,
+  getCustomAiProxyHosts,
+  isAllowedAiOrigin,
+  isAllowedAiProxyUrl,
+  parseServerPort,
+  shouldFallbackToEphemeralPort,
+} from './server/security.ts';
+import { getDefaultDbConfig, isDatabaseConfigReady } from './server/runtime-config.ts';
 
 const getDirname = () => {
   try {
@@ -30,6 +44,17 @@ const getDirname = () => {
   }
 };
 const currentDir = getDirname();
+
+function issueAiSessionCookie(res: any, phone: string) {
+  const session = createAiSession(phone);
+  res.cookie(AI_SESSION_COOKIE, session.token, {
+    httpOnly: true,
+    sameSite: 'strict',
+    secure: process.env.COOKIE_SECURE === 'true',
+    maxAge: AI_SESSION_TTL_MS,
+    path: '/',
+  });
+}
 
 let DB_CONFIG_FILE = process.env.DB_CONFIG_PATH || path.join(process.cwd(), 'db-config.json');
 let AI_SETTINGS_FILE = process.env.AI_SETTINGS_PATH || path.join(process.cwd(), 'ai-settings.json');
@@ -100,14 +125,7 @@ async function saveUpgradeHistory(history: any) {
   await fs.writeFile(UPGRADE_HISTORY_FILE, JSON.stringify(history, null, 2), 'utf-8');
 }
 
-const DEFAULT_DB_CONFIG = {
-  host: '39.105.83.161',
-  port: 3306,
-  user: 'pc',
-  password: 'root',
-  database: 'pc',
-  table: 'web user',
-};
+const DEFAULT_DB_CONFIG = getDefaultDbConfig();
 
 async function getDbConfig() {
   try {
@@ -137,8 +155,6 @@ async function saveAiSettings(settings: any) {
 
 async function startServer() {
   const app = express();
-  const PORT = 3000;
-
   app.use(express.json({ limit: '50mb' }));
   app.use(express.urlencoded({ limit: '50mb', extended: true }));
 
@@ -150,6 +166,11 @@ async function startServer() {
       await dbPool.end().catch(e => console.warn('DB close error (ignoring):', e.message));
     }
     try {
+      if (!isDatabaseConfigReady(currentDbConfig)) {
+        dbPool = null;
+        console.warn('MySQL is not configured. Set DB_HOST, DB_USER, and DB_NAME or provide db-config.json.');
+        return;
+      }
       const { host, port, user, password, database } = currentDbConfig;
       dbPool = mysql.createPool({
         host: host || 'localhost',
@@ -2249,7 +2270,7 @@ async function startServer() {
     }
   });
 
-  app.post('/api/auth/login', async (req, res) => {
+app.post('/api/auth/login', async (req, res) => {
     const { phone, password, code, isSmsLogin, macAddress } = req.body;
     
     if (!dbPool) {
@@ -2304,6 +2325,7 @@ async function startServer() {
             return res.status(401).json({ error: '手机号或密码错误' });
           }
         }
+        issueAiSessionCookie(res, phone);
         return res.json({ success: true, user: matchedUser, message: '已通过离线模拟安全模式登录' });
       }
 
@@ -2366,6 +2388,7 @@ async function startServer() {
         }
       }
 
+      issueAiSessionCookie(res, phone);
       return res.json({ success: true, user });
     } catch (err: any) {
       console.warn('Login error (ignoring):', err.message);
@@ -2373,6 +2396,16 @@ async function startServer() {
     }
   });
   
+  app.post('/api/auth/logout', (_req, res) => {
+    res.clearCookie(AI_SESSION_COOKIE, {
+      httpOnly: true,
+      sameSite: 'strict',
+      secure: process.env.COOKIE_SECURE === 'true',
+      path: '/',
+    });
+    res.json({ success: true });
+  });
+
   // AI Proxy Route to handle CORS issues with LLM providers
   
 // Tianyancha Open API Proxy Endpoint 1: 工商信息 - 企业基本信息 (接口ID: 1116)
@@ -2470,7 +2503,8 @@ app.all('/api/tianyancha/ic/baseinfo', async (req, res) => {
       });
     }
 
-    const token = process.env.TIANYANCHA_TOKEN || '6132353e-0ba4-48e5-ab60-8dbb6f1b9852';
+    const token = process.env.TIANYANCHA_TOKEN;
+    if (!token) return res.status(503).json({ error: '天眼查服务未配置访问 Token。' });
     const targetUrl = `https://open.api.tianyancha.com/services/open/ic/baseinfo/normal?keyword=${encodeURIComponent(keyword)}`;
 
     const response = await fetch(targetUrl, {
@@ -2951,7 +2985,8 @@ app.all('/api/tianyancha/certificate', async (req, res) => {
       });
     }
 
-    const token = process.env.TIANYANCHA_TOKEN || '6132353e-0ba4-48e5-ab60-8dbb6f1b9852';
+    const token = process.env.TIANYANCHA_TOKEN;
+    if (!token) return res.status(503).json({ error: '天眼查服务未配置访问 Token。' });
     const targetUrl = `https://open.api.tianyancha.com/services/open/m/certificate/2.0?name=${encodeURIComponent(name)}`;
 
     const response = await fetch(targetUrl, {
@@ -3068,7 +3103,8 @@ app.all('/api/tianyancha/certificate', async (req, res) => {
 });
 
 app.post('/api/admin/tianyancha/test', async (req, res) => {
-  const token = process.env.TIANYANCHA_TOKEN || '6132353e-0ba4-48e5-ab60-8dbb6f1b9852';
+  const token = process.env.TIANYANCHA_TOKEN;
+  if (!token) return res.status(503).json({ error: '天眼查服务未配置访问 Token。' });
   const companyName = (req.body.name || '河北启恒电力科技有限公司').toString().trim();
   const startTime = Date.now();
   
@@ -3295,18 +3331,34 @@ app.post('/api/certification/info', async (req, res) => {
 });
 
 app.post('/api/ai-proxy', async (req, res) => {
-    let { baseUrl, apiKey, body } = req.body;
+    const configuredOrigins = (process.env.APP_ORIGIN || process.env.APP_URL || '')
+      .split(',')
+      .map(value => value.trim())
+      .filter(Boolean);
+    const requestOrigin = req.get('origin') || undefined;
+    if (!isAllowedAiOrigin(requestOrigin, boundPort, configuredOrigins)) {
+      return res.status(403).json({ error: '请求来源未获授权。' });
+    }
+    const phone = getAiSessionPhone(
+      getAiSessionToken(req.headers.cookie),
+    );
+    if (!phone) {
+      return res.status(401).json({ error: '登录状态已失效，请重新登录后再调用 AI。' });
+    }
 
-    // Use environment secret if the client uses empty, dummy placeholder or default mock key
-    const isMockKey = !apiKey || apiKey === 'AIzaSyDTJJfeWqD5JHpimtHB1eQ-K_Pjo0BmrlM' || apiKey === 'MY_GEMINI_API_KEY' || apiKey.includes('INSERT_YOUR_KEY');
-    if (isMockKey && process.env.GEMINI_API_KEY) {
-      apiKey = process.env.GEMINI_API_KEY;
-    } else if (!apiKey) {
+    let { baseUrl, apiKey, body } = req.body || {};
+    const isGeminiRequest = Array.isArray(body?.contents);
+    const targetBaseUrl = baseUrl || 'https://generativelanguage.googleapis.com';
+    if (!isAllowedAiProxyUrl(targetBaseUrl, getCustomAiProxyHosts())) {
+      return res.status(400).json({ error: 'AI 服务地址不在允许列表中。请检查地址或配置 AI_PROXY_ALLOWED_HOSTS。' });
+    }
+
+    if (typeof apiKey !== 'string') apiKey = '';
+    if (isGeminiRequest && (!apiKey || apiKey === 'MY_GEMINI_API_KEY' || apiKey.includes('INSERT_YOUR_KEY'))) {
       apiKey = process.env.GEMINI_API_KEY;
     }
 
-    // Permit the default working key (AIzaSyDTJJfeWqD5JHpimtHB1eQ-K_Pjo0BmrlM) to run if no env key override was found
-    if (!apiKey || apiKey === 'MY_GEMINI_API_KEY' || apiKey.includes('INSERT_YOUR_KEY')) {
+    if (typeof apiKey !== 'string' || !apiKey.trim() || apiKey === 'MY_GEMINI_API_KEY' || apiKey.includes('INSERT_YOUR_KEY')) {
       return res.status(401).json({ 
         error: 'API key not valid',
         message: '未检测到有效的 API Key。请在 AI Studio 的“Secrets”面板中配置 GEMINI_API_KEY，或在应用的“AI引擎配置”中手动输入。',
@@ -3317,6 +3369,8 @@ app.post('/api/ai-proxy', async (req, res) => {
     if (!body) {
       return res.status(400).json({ error: 'Missing request body' });
     }
+
+    const proxyDeadline = Date.now() + 600000;
 
     try {
       // Robust URL construction
@@ -3329,7 +3383,7 @@ app.post('/api/ai-proxy', async (req, res) => {
       
       if (isGeminiNative || isGeminiUrl) {
         const cleanBaseUrl = targetUrl.replace(/\/$/, '');
-        const model = body.model || 'gemini-1.5-flash';
+        const model = body.model || 'gemini-3.5-flash';
         const cleanModel = model.startsWith('models/') ? model : `models/${model}`;
 
         const clientConfig = body.generation_config || body.generationConfig || {};
@@ -3388,13 +3442,14 @@ app.post('/api/ai-proxy', async (req, res) => {
         let attempt = 0;
         let success = false;
 
-        const modelQueue = [
-          'gemini-2.5-flash',
-          'gemini-1.5-flash',
-          'gemini-1.5-flash-8b'
-        ];
+        const configuredFallbacks = ['gemini-3.8-flash', 'gemini-3.7-flash', 'gemini-3.5-flash'];
+        const modelQueue = configuredFallbacks.filter(model => model !== currentModel.replace(/^models\//, ''));
+        retries = Math.min(retries, modelQueue.length + 1);
 
         while (attempt < retries) {
+          if (Date.now() >= proxyDeadline) {
+            return res.status(504).json({ error: 'AI 上游请求超过 10 分钟总时限，请缩小单次处理内容后重试。' });
+          }
           attempt++;
           try {
             response = await axios.post(fetchUrl, {
@@ -3406,7 +3461,8 @@ app.post('/api/ai-proxy', async (req, res) => {
               headers: {
                 'Content-Type': 'application/json'
               },
-              timeout: 600000,
+              timeout: Math.max(1, Math.min(600000, proxyDeadline - Date.now())),
+              maxRedirects: 0,
               validateStatus: () => true
             });
 
@@ -3418,7 +3474,7 @@ app.post('/api/ai-proxy', async (req, res) => {
 
             // 仅在首次尝试（即用户首选的模型）时，若发生未授权(401/403)或参数/配置错误(400/404)时才立即中止。
             // 之后的备用降级模型如果不可用或未开通(404)，应当继续尝试队列中的其他备择模型，而不是直接报错打断。
-            const isPermanentUserError = response.status === 400 || response.status === 401 || response.status === 403 || response.status === 404;
+            const isPermanentUserError = response.status === 400 || response.status === 401 || response.status === 403;
             if (attempt === 1 && isPermanentUserError) {
               console.warn(`[Proxy] Permanent parameter or authentication error detected on initial model (Status: ${response.status}). Bypassing retry.`);
               break;
@@ -3427,7 +3483,7 @@ app.post('/api/ai-proxy', async (req, res) => {
             console.warn(`[Proxy] Attempt ${attempt}/${retries} failed or unsupported. status: ${response.status}, payload: ${JSON.stringify(response?.data)}`);
             
             if (attempt < retries) {
-              const nextModel = modelQueue.find(m => m !== currentModel && !currentModel.endsWith(m));
+              const nextModel = modelQueue[attempt - 1];
               if (nextModel) {
                 const containsModelsPath = cleanModel.startsWith('models/');
                 currentModel = containsModelsPath 
@@ -3444,7 +3500,7 @@ app.post('/api/ai-proxy', async (req, res) => {
           } catch (axiosErr: any) {
             console.warn(`[Proxy] Axios post error during attempt ${attempt}:`, axiosErr.message);
             if (attempt < retries) {
-              const nextModel = modelQueue.find(m => m !== currentModel && !currentModel.endsWith(m));
+              const nextModel = modelQueue[attempt - 1];
               if (nextModel) {
                 const containsModelsPath = cleanModel.startsWith('models/');
                 currentModel = containsModelsPath 
@@ -3480,7 +3536,7 @@ app.post('/api/ai-proxy', async (req, res) => {
           if (currentModel !== cleanModel) {
             const originalUserSetupModel = body.model || '未设定';
             const fallbackModelSimple = currentModel.replace(/^models\//, '');
-            const combinedFriendlyMessage = `【全链路降级重试最终失败】\n您在控制面板首选配置的模型是 “${originalUserSetupModel}”。但在提交分析时该模型暂时无法返回有效输出（如 429 负载过大或由于非正式临时模型不可达）。底层系统智能地触发了降级退避重载机制，自动轮询尝试了备用极速模型 “${fallbackModelSimple}”，但最终仍宣告受限。\n\n💡 完美解决方案：\n1. 说明默认内置免费共享中转此时过于繁忙，建议在页面顶部“AI引擎配置”标签；\n2. 输入您的个人独享 API Key 及对应的 Model 名以直接获得 100% 极速计算保障；\n3. 或是将不符合要求的模型变回高兼容性的官方标准模型（如 “gemini-2.5-flash”）；\n\n(最末重度尝试时底层的报错细节: ${originalErrorText})`;
+            const combinedFriendlyMessage = `【模型回退重试失败】\n您配置的模型 “${originalUserSetupModel}” 及系统尝试的备用模型 “${fallbackModelSimple}” 均未能返回有效结果。请检查模型名称、API Key、服务端网络和上游配额；新配置可先使用稳定版 “gemini-3.5-flash” 验证。\n\n(最后一次请求的错误详情: ${originalErrorText})`;
             
             if (response.data && response.data.error) {
               response.data.error.message = combinedFriendlyMessage;
@@ -3548,8 +3604,9 @@ app.post('/api/ai-proxy', async (req, res) => {
 
         const response = await axios.post(targetUrl, body, {
           headers,
-          timeout: 600000, 
-          validateStatus: () => true 
+                timeout: Math.max(1, Math.min(600000, proxyDeadline - Date.now())),
+                maxRedirects: 0,
+                validateStatus: () => true
         });
 
         console.log(`[Proxy] Target responded with: ${response.status}`);
@@ -3663,12 +3720,25 @@ app.post('/api/ai-proxy', async (req, res) => {
     }
   });
 
-  const actualPort = 3000;
+  const actualPort = parseServerPort(process.env.PORT);
+  let boundPort = actualPort;
   const httpServer = http.createServer(app);
   
   const io = new SocketIOServer(httpServer, {
-    cors: { origin: '*' },
-    maxHttpBufferSize: 1e8, // 100 MB limit
+    maxHttpBufferSize: 25 * 1024 * 1024,
+    cors: {
+      origin: (origin, callback) => {
+        const configuredOrigins = (process.env.APP_ORIGIN || process.env.APP_URL || '')
+          .split(',')
+          .map(value => value.trim())
+          .filter(Boolean);
+        if (isAllowedAiOrigin(origin, boundPort, configuredOrigins)) {
+          callback(null, true);
+        } else {
+          callback(new Error('Origin is not allowed'));
+        }
+      },
+    },
     pingTimeout: 600000,
     pingInterval: 120000
   });
@@ -3678,36 +3748,41 @@ app.post('/api/ai-proxy', async (req, res) => {
     
     socket.on('ai-proxy', async (data, callback) => {
       try {
-        let { baseUrl, apiKey, body, phone } = data;
+        const phone = getAiSessionPhone(getAiSessionToken(socket.handshake.headers.cookie));
+        if (!phone) {
+          return callback({ status: 401, data: { error: { message: '登录状态已失效，请重新登录后再调用 AI。' } } });
+        }
+
+        let { baseUrl, apiKey, body } = data || {};
+        const isGeminiRequest = Array.isArray(body?.contents);
+        const targetBaseUrl = baseUrl || 'https://generativelanguage.googleapis.com';
+        if (!isAllowedAiProxyUrl(targetBaseUrl, getCustomAiProxyHosts())) {
+          return callback({ status: 400, data: { error: { message: 'AI 服务地址不在允许列表中。请检查地址或配置 AI_PROXY_ALLOWED_HOSTS。' } } });
+        }
+        if (typeof apiKey !== 'string') apiKey = '';
 
         // Subscription check for SaaS limiting
-        if (phone) {
-          try {
-            const subStatus = await getSubscriptionStatus(phone);
-            if (subStatus.used_today >= subStatus.ai_limit_per_day) {
-              return callback({
-                status: 403,
-                data: {
-                  error: {
-                    message: `您今日的 AI 匹配额度已达上限（${subStatus.used_today}/${subStatus.ai_limit_per_day}次）。专业商用版拥有每日 100 次额度，企业专属版拥有 10,000 次。请前往“会员中心”升级您的方案，或在“AI 引擎配置”中开启并使用您个人的 API Key。`
-                  }
+        try {
+          const subStatus = await getSubscriptionStatus(phone);
+          if (subStatus.used_today >= subStatus.ai_limit_per_day) {
+            return callback({
+              status: 403,
+              data: {
+                error: {
+                  message: `您今日的 AI 匹配额度已达上限（${subStatus.used_today}/${subStatus.ai_limit_per_day}次）。专业商用版拥有每日 100 次额度，企业专属版拥有 10,000 次。请前往“会员中心”升级您的方案，或在“AI 引擎配置”中配置个人 API Key。`
                 }
-              });
-            }
-          } catch (limitErr) {
-            console.warn('Subscription checking failed inside socket proxy:', limitErr);
+              }
+            });
           }
+        } catch (limitErr) {
+          console.warn('Subscription checking failed inside socket proxy:', limitErr);
         }
 
-        // Use environment secret if the client uses empty, dummy placeholder or default mock key
-        const isMockKey = !apiKey || apiKey === 'AIzaSyDTJJfeWqD5JHpimtHB1eQ-K_Pjo0BmrlM' || apiKey === 'MY_GEMINI_API_KEY' || apiKey.includes('INSERT_YOUR_KEY');
-        if (isMockKey && process.env.GEMINI_API_KEY) {
-          apiKey = process.env.GEMINI_API_KEY;
-        } else if (!apiKey) {
+        if (isGeminiRequest && (!apiKey || apiKey === 'MY_GEMINI_API_KEY' || apiKey.includes('INSERT_YOUR_KEY'))) {
           apiKey = process.env.GEMINI_API_KEY;
         }
 
-        if (!apiKey || apiKey === 'MY_GEMINI_API_KEY' || apiKey.includes('INSERT_YOUR_KEY')) {
+        if (typeof apiKey !== 'string' || !apiKey.trim() || apiKey === 'MY_GEMINI_API_KEY' || apiKey.includes('INSERT_YOUR_KEY')) {
           return callback({ status: 401, data: { error: 'API key not valid', message: '未检测到有效的 API Key。' } });
         }
 
@@ -3715,13 +3790,15 @@ app.post('/api/ai-proxy', async (req, res) => {
           return callback({ status: 400, data: { error: 'Missing request body' } });
         }
 
+        const proxyDeadline = Date.now() + 600000;
+
         let targetUrl = baseUrl || 'https://generativelanguage.googleapis.com';
         const isGeminiNative = !!body.contents;
         const isGeminiUrl = targetUrl.includes('generativelanguage.googleapis.com');
         
         if (isGeminiNative || isGeminiUrl) {
           const cleanBaseUrl = targetUrl.replace(/\/$/, '');
-          const model = body.model || 'gemini-1.5-flash';
+          const model = body.model || 'gemini-3.5-flash';
           const cleanModel = model.startsWith('models/') ? model : `models/${model}`;
 
           const clientConfig = body.generation_config || body.generationConfig || {};
@@ -3768,9 +3845,14 @@ app.post('/api/ai-proxy', async (req, res) => {
           let retries = 4;
           let attempt = 0;
           let success = false;
-          const modelQueue = ['gemini-2.5-flash', 'gemini-1.5-flash', 'gemini-1.5-flash-8b'];
+          const configuredFallbacks = ['gemini-3.8-flash', 'gemini-3.7-flash', 'gemini-3.5-flash'];
+          const modelQueue = configuredFallbacks.filter(model => model !== currentModel.replace(/^models\//, ''));
+          retries = Math.min(retries, modelQueue.length + 1);
 
           while (attempt < retries) {
+            if (Date.now() >= proxyDeadline) {
+              return callback({ status: 504, data: { error: { message: 'AI 上游请求超过 10 分钟总时限，请缩小单次处理内容后重试。' } } });
+            }
             attempt++;
             try {
               response = await axios.post(fetchUrl, {
@@ -3780,8 +3862,9 @@ app.post('/api/ai-proxy', async (req, res) => {
                 ...(Object.keys(config).length > 0 ? { generationConfig: config } : {})
               }, {
                 headers: { 'Content-Type': 'application/json' },
-                timeout: 600000,
-                validateStatus: () => true
+          timeout: Math.max(1, Math.min(600000, proxyDeadline - Date.now())),
+          maxRedirects: 0,
+          validateStatus: () => true
               });
 
               const hasValidPayload = response?.data && (typeof response.data === 'object') && Object.keys(response.data).length > 0;
@@ -3790,11 +3873,11 @@ app.post('/api/ai-proxy', async (req, res) => {
                 break;
               }
 
-              const isPermanentUserError = response.status === 400 || response.status === 401 || response.status === 403 || response.status === 404;
+              const isPermanentUserError = response.status === 400 || response.status === 401 || response.status === 403;
               if (attempt === 1 && isPermanentUserError) break;
 
               if (attempt < retries) {
-                const nextModel = modelQueue.find(m => m !== currentModel && !currentModel.endsWith(m));
+                const nextModel = modelQueue[attempt - 1];
                 if (nextModel) {
                   const containsModelsPath = cleanModel.startsWith('models/');
                   currentModel = containsModelsPath ? (nextModel.startsWith('models/') ? nextModel : `models/${nextModel}`) : nextModel.replace(/^models\//, '');
@@ -3805,7 +3888,7 @@ app.post('/api/ai-proxy', async (req, res) => {
               }
             } catch (axiosErr: any) {
               if (attempt < retries) {
-                const nextModel = modelQueue.find(m => m !== currentModel && !currentModel.endsWith(m));
+                const nextModel = modelQueue[attempt - 1];
                 if (nextModel) {
                   const containsModelsPath = cleanModel.startsWith('models/');
                   currentModel = containsModelsPath ? (nextModel.startsWith('models/') ? nextModel : `models/${nextModel}`) : nextModel.replace(/^models\//, '');
@@ -3880,8 +3963,9 @@ app.post('/api/ai-proxy', async (req, res) => {
               'User-Agent': 'CertMatch-AI-Engine/1.0',
               'Authorization': `Bearer ${apiKey}`
             },
-            timeout: 600000, 
-            validateStatus: () => true 
+            timeout: Math.max(1, Math.min(600000, proxyDeadline - Date.now())),
+            maxRedirects: 0,
+            validateStatus: () => true
           });
           
           let outData = response.data;
@@ -3906,9 +3990,28 @@ app.post('/api/ai-proxy', async (req, res) => {
     });
   });
 
-  httpServer.listen(actualPort, '0.0.0.0', () => {
-    console.log(`Server running at http://localhost:${actualPort}`);
+  const bindHost = process.env.HOST || (process.env.NODE_ENV === 'production' ? '0.0.0.0' : '127.0.0.1');
+  const listeningPort = await new Promise<number>((resolve, reject) => {
+    let usedEphemeralFallback = false;
+    httpServer.on('error', (error: NodeJS.ErrnoException) => {
+      if (!usedEphemeralFallback && shouldFallbackToEphemeralPort(error.code, process.env.PORT, process.env.NODE_ENV)) {
+        usedEphemeralFallback = true;
+        console.warn(`Port ${actualPort} could not be bound (${error.code}); development server will use an available port instead.`);
+        httpServer.listen(0, bindHost);
+        return;
+      }
+      reject(error);
+    });
+    httpServer.listen(actualPort, bindHost, () => {
+      const address = httpServer.address();
+      const port = typeof address === 'object' && address ? address.port : actualPort;
+      boundPort = port;
+      console.log(`Server running at http://${bindHost}:${port}`);
+      resolve(port);
+    });
   });
+
+  return listeningPort;
 }
 
-startServer();
+export const serverReady = startServer();

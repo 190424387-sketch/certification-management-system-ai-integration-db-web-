@@ -1,4 +1,7 @@
 node_modules/
+__pycache__/
+*.py[cod]
+.ai-certification-dev-*.cjs
 build/
 dist/
 coverage/
@@ -52,4 +55,6 @@ dist-exe/
 publish/
 app/
 workspace/
+.worktrees/
+.superpowers/
 

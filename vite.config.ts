@@ -44,6 +44,15 @@ export default defineConfig(({mode}) => {
       // HMR is disabled in AI Studio via DISABLE_HMR env var.
       // Do not modifyâfile watching is disabled to prevent flickering during agent edits.
       hmr: process.env.DISABLE_HMR !== 'true',
+      watch: {
+        // Runtime state is written by the backend and must not trigger reloads.
+        ignored: [
+          '**/upgrade-config.json',
+          '**/upgrade-history.json',
+          '**/db-config.json',
+          '**/ai-settings.json',
+        ],
+      },
     },
   };
 });
